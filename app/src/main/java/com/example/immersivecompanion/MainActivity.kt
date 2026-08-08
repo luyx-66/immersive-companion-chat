@@ -613,7 +613,7 @@ fun AppTopBar(screen: String, onScreen: (String) -> Unit, roleName: String) {
         title = {
             Column {
                 Text(roleName.ifBlank { "沉浸陪伴聊天" }, fontWeight = FontWeight.Bold, fontSize = 18.sp)
-                Text("本地记忆 · 可选模型 · 自动生成图", fontSize = 11.sp, color = Color(0xFF9AA1B8))
+                Text("v1.1 · 本地记忆 · 可选模型 · 自动生成图", fontSize = 11.sp, color = Color(0xFF9AA1B8))
             }
         },
         actions = {
