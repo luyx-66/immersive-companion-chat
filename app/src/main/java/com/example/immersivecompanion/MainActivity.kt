@@ -274,6 +274,8 @@ object OpenAiCompatApi {
 
             Rules:
             - Generate an image for concrete scenes, rooms, outfits, characters, fantasy settings, places, moods, or story moments.
+            - If the conversation includes explicit sexual content, fetish language, nudity, or adult roleplay, set should_generate_image to false and image_prompt to an empty string.
+            - Image prompts must be safe-for-work: no nudity, explicit sexual content, fetish terms, or sexualized body descriptions.
             - Do not generate an image for ordinary settings changes or short factual questions.
             - The image prompt must be in English.
             - Do not invent memory. Only store stable facts or preferences from the user.
@@ -367,7 +369,7 @@ object OpenAiCompatApi {
             val taskText = request("GET", taskUrl(settings.baseUrl, taskId), settings.apiKey, null)
             val status = parseTaskStatus(taskText)
             if (status.equals("failed", ignoreCase = true)) {
-                throw IllegalStateException("Image task failed: ${taskText.take(500)}")
+                throw IllegalStateException(userFriendlyImageFailure(taskText))
             }
             val taskImage = parseImageUrl(taskText)
             if (taskImage.first.isNotBlank() || taskImage.second.isNotBlank()) return taskImage
@@ -428,6 +430,17 @@ object OpenAiCompatApi {
         val data = root.opt("data")
         if (data is JSONObject) return data.optString("status")
         return root.optString("status")
+    }
+
+    private fun userFriendlyImageFailure(responseText: String): String {
+        val lower = responseText.lowercase()
+        return when {
+            lower.contains("content moderation") || lower.contains("rejected") -> {
+                "图片生成被模型审核拒绝。请关闭自动生成图，或把图片描述改成普通角色立绘/场景图，避免露骨、性暗示、裸露或特殊癖好词。"
+            }
+            lower.contains("400") -> "图片模型返回 400，请检查图片模型名、尺寸参数和提示词。"
+            else -> "图片生成失败：${responseText.take(300)}"
+        }
     }
 
     private fun parseChatContent(responseText: String): String {
@@ -758,7 +771,7 @@ fun AppTopBar(screen: String, onScreen: (String) -> Unit, roleName: String) {
         title = {
             Column {
                 Text(roleName.ifBlank { "沉浸陪伴聊天" }, fontWeight = FontWeight.Bold, fontSize = 18.sp)
-                Text("v1.2 · APIMart路径修复 · 本地记忆", fontSize = 11.sp, color = Color(0xFF9AA1B8))
+                Text("v1.3 · 图片审核提示优化 · 本地记忆", fontSize = 11.sp, color = Color(0xFF9AA1B8))
             }
         },
         actions = {
