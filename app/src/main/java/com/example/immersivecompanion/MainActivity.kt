@@ -244,12 +244,7 @@ object OpenAiCompatApi {
             body.put("messages", apiMessages)
 
             val text = request("POST", joinUrl(settings.baseUrl, "chat/completions"), settings.apiKey, body.toString())
-            JSONObject(text)
-                .getJSONArray("choices")
-                .getJSONObject(0)
-                .getJSONObject("message")
-                .getString("content")
-                .trim()
+            parseChatContent(text).trim()
         }
 
     suspend fun analyzeForImageAndMemory(
@@ -294,11 +289,7 @@ object OpenAiCompatApi {
             )
 
         val text = request("POST", joinUrl(settings.baseUrl, "chat/completions"), settings.apiKey, body.toString())
-        val content = JSONObject(text)
-            .getJSONArray("choices")
-            .getJSONObject(0)
-            .getJSONObject("message")
-            .getString("content")
+        val content = parseChatContent(text)
             .trim()
             .removePrefix("```json")
             .removePrefix("```")
@@ -331,14 +322,101 @@ object OpenAiCompatApi {
             .put("size", settings.imageSize.ifBlank { "1024x1024" })
 
         val text = request("POST", joinUrl(settings.baseUrl, "images/generations"), settings.apiKey, body.toString())
-        val first = JSONObject(text).getJSONArray("data").getJSONObject(0)
+        val first = JSONObject(text).getJSONArray("data").get(0)
+        val imageUrl: String
+        val imageBase64: String
+        if (first is JSONObject) {
+            imageUrl = first.optString("url")
+            imageBase64 = first.optString("b64_json")
+        } else {
+            imageUrl = first.toString()
+            imageBase64 = ""
+        }
         ChatMessage(
             id = System.currentTimeMillis(),
             role = "image",
             text = "图片提示词：$fullPrompt",
-            imageUrl = first.optString("url"),
-            imageBase64 = first.optString("b64_json"),
+            imageUrl = imageUrl,
+            imageBase64 = imageBase64,
         )
+    }
+
+    private fun parseChatContent(responseText: String): String {
+        val root = JSONObject(responseText)
+        val choices = root.optJSONArray("choices")
+        if (choices != null && choices.length() > 0) {
+            val choice = choices.get(0)
+            if (choice is JSONObject) {
+                val message = choice.opt("message")
+                when (message) {
+                    is JSONObject -> return contentToText(message.opt("content"))
+                    is String -> return message
+                }
+                val delta = choice.opt("delta")
+                if (delta is JSONObject) return contentToText(delta.opt("content"))
+                val text = choice.optString("text")
+                if (text.isNotBlank()) return text
+            } else {
+                return choice.toString()
+            }
+        }
+
+        val message = root.opt("message")
+        when (message) {
+            is JSONObject -> return contentToText(message.opt("content"))
+            is String -> if (message.isNotBlank()) return message
+        }
+
+        val data = root.opt("data")
+        when (data) {
+            is JSONObject -> {
+                val content = contentToText(data.opt("content"))
+                if (content.isNotBlank()) return content
+                val output = contentToText(data.opt("output"))
+                if (output.isNotBlank()) return output
+            }
+            is String -> if (data.isNotBlank()) return data
+        }
+
+        val output = contentToText(root.opt("output"))
+        if (output.isNotBlank()) return output
+
+        val content = contentToText(root.opt("content"))
+        if (content.isNotBlank()) return content
+
+        throw IllegalStateException("接口返回格式无法识别：${responseText.take(500)}")
+    }
+
+    private fun contentToText(value: Any?): String {
+        return when (value) {
+            null -> ""
+            JSONObject.NULL -> ""
+            is String -> value
+            is JSONArray -> buildString {
+                for (i in 0 until value.length()) {
+                    val item = value.get(i)
+                    when (item) {
+                        is JSONObject -> {
+                            val text = item.optString("text")
+                            val content = item.optString("content")
+                            val imageUrl = item.optString("image_url")
+                            when {
+                                text.isNotBlank() -> append(text)
+                                content.isNotBlank() -> append(content)
+                                imageUrl.isNotBlank() -> append(imageUrl)
+                            }
+                        }
+                        else -> append(item.toString())
+                    }
+                    if (i != value.length() - 1) append('\n')
+                }
+            }
+            is JSONObject -> {
+                val text = value.optString("text")
+                if (text.isNotBlank()) text else value.toString()
+            }
+            else -> value.toString()
+        }
     }
 
     private fun buildSystemPrompt(settings: AppSettings, memory: String): String {
