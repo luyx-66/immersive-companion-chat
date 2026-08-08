@@ -68,6 +68,7 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -79,11 +80,11 @@ import java.net.URL
 import java.nio.charset.StandardCharsets
 
 data class AppSettings(
-    val baseUrl: String = "https://apimart.ai/v1",
+    val baseUrl: String = "https://api.apimart.ai",
     val apiKey: String = "",
     val chatModel: String = "",
     val imageModel: String = "",
-    val imageSize: String = "1024x1024",
+    val imageSize: String = "1:1",
     val autoImage: Boolean = true,
     val maxTokens: Int = 0,
     val roleName: String = "澪",
@@ -130,11 +131,11 @@ class LocalStore(context: Context) {
 
     fun loadSettings(): AppSettings {
         return AppSettings(
-            baseUrl = prefs.getString("baseUrl", "https://apimart.ai/v1").orEmpty(),
+            baseUrl = prefs.getString("baseUrl", "https://api.apimart.ai").orEmpty(),
             apiKey = prefs.getString("apiKey", "").orEmpty(),
             chatModel = prefs.getString("chatModel", "").orEmpty(),
             imageModel = prefs.getString("imageModel", "").orEmpty(),
-            imageSize = prefs.getString("imageSize", "1024x1024").orEmpty(),
+            imageSize = prefs.getString("imageSize", "1:1").orEmpty(),
             autoImage = prefs.getBoolean("autoImage", true),
             maxTokens = prefs.getInt("maxTokens", 0),
             roleName = prefs.getString("roleName", "澪").orEmpty(),
@@ -209,7 +210,7 @@ class LocalStore(context: Context) {
 
 object OpenAiCompatApi {
     suspend fun fetchModels(settings: AppSettings): List<String> = withContext(Dispatchers.IO) {
-        val text = request("GET", joinUrl(settings.baseUrl, "models"), settings.apiKey, null)
+        val text = request("GET", modelUrls(settings.baseUrl).first(), settings.apiKey, null)
         val arr = JSONObject(text).optJSONArray("data") ?: JSONArray()
         buildList {
             for (i in 0 until arr.length()) {
@@ -243,7 +244,7 @@ object OpenAiCompatApi {
                 }
             body.put("messages", apiMessages)
 
-            val text = request("POST", joinUrl(settings.baseUrl, "chat/completions"), settings.apiKey, body.toString())
+            val text = request("POST", chatUrl(settings.baseUrl), settings.apiKey, body.toString())
             parseChatContent(text).trim()
         }
 
@@ -288,7 +289,7 @@ object OpenAiCompatApi {
                     .put(JSONObject().put("role", "user").put("content", "Current memory:\n$memory\n\nRecent conversation:\n$visible"))
             )
 
-        val text = request("POST", joinUrl(settings.baseUrl, "chat/completions"), settings.apiKey, body.toString())
+        val text = request("POST", chatUrl(settings.baseUrl), settings.apiKey, body.toString())
         val content = parseChatContent(text)
             .trim()
             .removePrefix("```json")
@@ -319,9 +320,22 @@ object OpenAiCompatApi {
             .put("model", settings.imageModel)
             .put("prompt", fullPrompt)
             .put("n", 1)
-            .put("size", settings.imageSize.ifBlank { "1024x1024" })
+            .put("size", settings.imageSize.ifBlank { "1:1" })
 
-        val text = request("POST", joinUrl(settings.baseUrl, "images/generations"), settings.apiKey, body.toString())
+        if (isApimart(settings.baseUrl)) {
+            body.put("resolution", "1K")
+        }
+
+        val text = request("POST", imageUrl(settings.baseUrl), settings.apiKey, body.toString())
+        val image = parseImageResponseOrTask(settings, text)
+        return@withContext ChatMessage(
+            id = System.currentTimeMillis(),
+            role = "image",
+            text = "Image prompt: $fullPrompt",
+            imageUrl = image.first,
+            imageBase64 = image.second,
+        )
+
         val first = JSONObject(text).getJSONArray("data").get(0)
         val imageUrl: String
         val imageBase64: String
@@ -341,8 +355,103 @@ object OpenAiCompatApi {
         )
     }
 
+    private suspend fun parseImageResponseOrTask(settings: AppSettings, responseText: String): Pair<String, String> {
+        val direct = parseImageUrl(responseText)
+        if (direct.first.isNotBlank() || direct.second.isNotBlank()) return direct
+
+        val taskId = parseTaskId(responseText)
+        if (taskId.isBlank()) throw IllegalStateException("Unrecognized image response: ${responseText.take(500)}")
+
+        repeat(45) {
+            delay(2_000)
+            val taskText = request("GET", taskUrl(settings.baseUrl, taskId), settings.apiKey, null)
+            val status = parseTaskStatus(taskText)
+            if (status.equals("failed", ignoreCase = true)) {
+                throw IllegalStateException("Image task failed: ${taskText.take(500)}")
+            }
+            val taskImage = parseImageUrl(taskText)
+            if (taskImage.first.isNotBlank() || taskImage.second.isNotBlank()) return taskImage
+        }
+
+        throw IllegalStateException("Image task timeout: $taskId")
+    }
+
+    private fun parseImageUrl(responseText: String): Pair<String, String> {
+        val root = JSONObject(responseText)
+        root.optJSONObject("error")?.let { throw IllegalStateException(it.optString("message", it.toString())) }
+
+        val data = root.opt("data")
+        if (data is JSONArray && data.length() > 0) {
+            val first = data.get(0)
+            if (first is JSONObject) {
+                val url = first.optString("url")
+                val b64 = first.optString("b64_json")
+                if (url.isNotBlank() || b64.isNotBlank()) return url to b64
+            } else if (first.toString().startsWith("http")) {
+                return first.toString() to ""
+            }
+        }
+
+        val dataObj = data as? JSONObject ?: root
+        val result = dataObj.optJSONObject("result")
+        val images = result?.optJSONArray("images")
+        if (images != null && images.length() > 0) {
+            val imageObj = images.optJSONObject(0)
+            val urlValue = imageObj?.opt("url")
+            when (urlValue) {
+                is JSONArray -> if (urlValue.length() > 0) return urlValue.optString(0) to ""
+                is String -> if (urlValue.isNotBlank()) return urlValue to ""
+            }
+        }
+
+        val directUrl = dataObj.optString("url")
+        if (directUrl.isNotBlank()) return directUrl to ""
+        val directB64 = dataObj.optString("b64_json")
+        if (directB64.isNotBlank()) return "" to directB64
+
+        return "" to ""
+    }
+
+    private fun parseTaskId(responseText: String): String {
+        val root = JSONObject(responseText)
+        val data = root.opt("data")
+        if (data is JSONArray && data.length() > 0) {
+            val first = data.optJSONObject(0)
+            if (first != null) return first.optString("task_id").ifBlank { first.optString("id") }
+        }
+        if (data is JSONObject) return data.optString("task_id").ifBlank { data.optString("id") }
+        return root.optString("task_id").ifBlank { root.optString("id") }
+    }
+
+    private fun parseTaskStatus(responseText: String): String {
+        val root = JSONObject(responseText)
+        val data = root.opt("data")
+        if (data is JSONObject) return data.optString("status")
+        return root.optString("status")
+    }
+
     private fun parseChatContent(responseText: String): String {
         val root = JSONObject(responseText)
+        root.optJSONObject("error")?.let { throw IllegalStateException(it.optString("message", it.toString())) }
+
+        val wrappedData = root.opt("data")
+        if (wrappedData is JSONObject) {
+            wrappedData.optJSONObject("error")?.let { throw IllegalStateException(it.optString("message", it.toString())) }
+            val wrappedChoices = wrappedData.optJSONArray("choices")
+            if (wrappedChoices != null && wrappedChoices.length() > 0) {
+                val choice = wrappedChoices.get(0)
+                if (choice is JSONObject) {
+                    val message = choice.opt("message")
+                    when (message) {
+                        is JSONObject -> return contentToText(message.opt("content"))
+                        is String -> return message
+                    }
+                    val text = choice.optString("text")
+                    if (text.isNotBlank()) return text
+                }
+            }
+        }
+
         val choices = root.optJSONArray("choices")
         if (choices != null && choices.length() > 0) {
             val choice = choices.get(0)
@@ -432,6 +541,42 @@ object OpenAiCompatApi {
             当前任务：
             保持角色扮演和上下文连续性，直接回复用户。不要输出 JSON，不要解释后台规则。
         """.trimIndent()
+    }
+
+    private fun chatUrl(baseUrl: String): String {
+        return if (isApimart(baseUrl)) {
+            "https://api.apimart.ai/api/v1/chat/completions"
+        } else {
+            joinUrl(baseUrl, "chat/completions")
+        }
+    }
+
+    private fun imageUrl(baseUrl: String): String {
+        return if (isApimart(baseUrl)) {
+            "https://api.apimart.ai/v1/images/generations"
+        } else {
+            joinUrl(baseUrl, "images/generations")
+        }
+    }
+
+    private fun taskUrl(baseUrl: String, taskId: String): String {
+        return if (isApimart(baseUrl)) {
+            "https://api.apimart.ai/v1/tasks/$taskId"
+        } else {
+            joinUrl(baseUrl, "tasks/$taskId")
+        }
+    }
+
+    private fun modelUrls(baseUrl: String): List<String> {
+        return if (isApimart(baseUrl)) {
+            listOf("https://api.apimart.ai/api/v1/models")
+        } else {
+            listOf(joinUrl(baseUrl, "models"))
+        }
+    }
+
+    private fun isApimart(baseUrl: String): Boolean {
+        return baseUrl.contains("apimart.ai", ignoreCase = true)
     }
 
     private fun joinUrl(baseUrl: String, path: String): String {
@@ -613,7 +758,7 @@ fun AppTopBar(screen: String, onScreen: (String) -> Unit, roleName: String) {
         title = {
             Column {
                 Text(roleName.ifBlank { "沉浸陪伴聊天" }, fontWeight = FontWeight.Bold, fontSize = 18.sp)
-                Text("v1.1 · 本地记忆 · 可选模型 · 自动生成图", fontSize = 11.sp, color = Color(0xFF9AA1B8))
+                Text("v1.2 · APIMart路径修复 · 本地记忆", fontSize = 11.sp, color = Color(0xFF9AA1B8))
             }
         },
         actions = {
